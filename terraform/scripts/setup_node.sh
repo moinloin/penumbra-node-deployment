@@ -28,32 +28,6 @@ chown 1000:1000 /mnt/penumbra-data/penumbra
 mkdir -p /opt/penumbra-node
 cd /opt/penumbra-node
 
-cat > docker-compose.yml << 'EOL'
-version: '3.8'
-
-services:
-  penumbra-node:
-    build: .
-    container_name: penumbra-node
-    environment:
-      - NODE_URL=${node_url}
-      - MONIKER=${moniker}
-      - EXTERNAL_ADDRESS=${external_address}:26656
-      - FETCH_HISTORY=${fetch_history}
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=penumbra
-      - REINDEX_DB=penumbra_indexed
-    volumes:
-      - /mnt/penumbra-data/penumbra:/home/penumbra/.penumbra
-    ports:
-      - "26656:26656"
-      - "26657:26657"
-      - "8080:8080"
-      - "443:443"
-    restart: unless-stopped
-EOL
-
 cat > Dockerfile << 'EOL'
 FROM ubuntu:22.04
 
@@ -71,6 +45,14 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     wget \
     postgresql-client \
+    clang \
+    libclang-dev \
+    llvm-dev \
+    zlib1g-dev \
+    libbz2-dev \
+    libsnappy-dev \
+    liblz4-dev \
+    libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
