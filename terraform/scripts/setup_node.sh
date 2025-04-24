@@ -1,4 +1,6 @@
 #!/bin/bash
+# setup_node.sh - Script to set up a Penumbra node with reindexer capability
+
 set -e
 
 apt-get update
@@ -28,6 +30,33 @@ chown 1000:1000 /mnt/penumbra-data/penumbra
 mkdir -p /opt/penumbra-node
 cd /opt/penumbra-node
 
+cat > docker-compose.yml << 'EOL'
+version: '3.8'
+
+services:
+  penumbra-node:
+    build: .
+    container_name: penumbra-node
+    environment:
+      - NODE_URL=${node_url}
+      - MONIKER=${moniker}
+      - EXTERNAL_ADDRESS=${external_address}:26656
+      - FETCH_HISTORY=${fetch_history}
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=penumbra
+      - REINDEX_DB=penumbra_indexed
+    volumes:
+      - /mnt/penumbra-data/penumbra:/home/penumbra/.penumbra
+      - /var/run/postgresql:/var/run/postgresql
+    ports:
+      - "26656:26656"
+      - "26657:26657"
+      - "8080:8080"
+      - "443:443"
+    restart: unless-stopped
+EOL
+
 cat > Dockerfile << 'EOL'
 FROM ubuntu:22.04
 
@@ -35,6 +64,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/root
 ENV PATH="${PATH}:/usr/local/bin"
 
+# Install dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
@@ -53,11 +83,14 @@ RUN apt-get update && apt-get install -y \
     libsnappy-dev \
     liblz4-dev \
     libzstd-dev \
+    golang-go \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="${HOME}/.cargo/bin:${PATH}"
 
+# Install pd and cometbft
 RUN curl -sSfL -O https://github.com/penumbra-zone/penumbra/releases/latest/download/pd-x86_64-unknown-linux-gnu.tar.gz && \
     tar -xf pd-x86_64-unknown-linux-gnu.tar.gz && \
     mv pd-x86_64-unknown-linux-gnu/pd /usr/local/bin/ && \
@@ -68,11 +101,17 @@ RUN curl -sSfL -O https://github.com/cometbft/cometbft/releases/download/v0.37.1
     mv cometbft /usr/local/bin/ && \
     rm -rf cometbft_0.37.15_linux_amd64.tar.gz
 
+# Clone and build reindexer (with Go dependencies)
 RUN git clone https://github.com/penumbra-zone/reindexer.git /opt/reindexer
 WORKDIR /opt/reindexer
+# Set up Go environment variables
+ENV GOPATH=/root/go
+ENV PATH="${GOPATH}/bin:${PATH}"
+RUN go install golang.org/x/tools/cmd/stringer@latest
 RUN cargo build --release && \
-    cp target/release/reindexer /usr/local/bin/
+    cp target/release/penumbra-reindexer /usr/local/bin/
 
+# Create penumbra user
 RUN useradd -m -d /home/penumbra penumbra -s /bin/bash
 
 COPY entrypoint.sh /usr/local/bin/
@@ -137,15 +176,50 @@ fi
 if [ "$FETCH_HISTORY" = "true" ]; then
     echo "Fetching historical data..."
     
+    # Download the latest archive from artifacts.plinfra.net
     curl -O "$ARCHIVE_URL"
     ARCHIVE_FILE=$(basename "$ARCHIVE_URL")
     
+    # Extract the archive to a temporary location
     echo "Extracting archive..."
-    tar -xzf "$ARCHIVE_FILE" -C "$NETWORK_DATA"
-    rm "$ARCHIVE_FILE"
+    mkdir -p /tmp/archive
+    tar -xzf "$ARCHIVE_FILE" -C /tmp/archive
     
-    echo "Configuring CometBFT indexer..."
+    # Create a PostgreSQL database for events if it doesn't exist
+    echo "Setting up PostgreSQL database..."
+    # Since we're using the socket connection, we should be able to connect as postgres
+    PGPASSWORD="$POSTGRES_PASSWORD" psql -h localhost -U "$POSTGRES_USER" -c "CREATE DATABASE $POSTGRES_DB;" || true
+    PGPASSWORD="$POSTGRES_PASSWORD" psql -h localhost -U "$POSTGRES_USER" -c "CREATE DATABASE $REINDEX_DB;" || true
+    
+    # Create working directory for reindexing
+    mkdir -p /tmp/regen
+    
+    # Run the reindexer to process the historical blocks
+    echo "Running reindexer..."
+    # First pass to process pre-upgrade blocks (you'll need to know the exact height)
+    # This is just an example, adjust the stop-height based on actual upgrade points
+    if [ -f "/tmp/archive/reindexer_archive.bin" ]; then
+        penumbra-reindexer regen \
+            --database-url "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:5432/$POSTGRES_DB?sslmode=disable" \
+            --working-dir /tmp/regen \
+            --archive-file "/tmp/archive/reindexer_archive.bin"
+    else
+        echo "No reindexer archive found, skipping reindexing"
+    fi
+    
+    # After reindexing, copy blocks to our node directory
+    if [ -d "/tmp/archive/cometbft" ]; then
+        echo "Copying historical block data to node directory..."
+        cp -r /tmp/archive/cometbft/* "$NETWORK_DATA/cometbft/"
+    fi
+    
+    # Configure CometBFT to use kv indexer for events
+    echo "Configuring CometBFT indexer to store events..."
     sed -i 's/indexer = ".*"/indexer = "kv"/' "$NETWORK_DATA/cometbft/config/config.toml"
+    
+    # Clean up
+    rm -rf /tmp/regen /tmp/archive
+    rm "$ARCHIVE_FILE"
     
     echo "Historical data processing completed."
 else
@@ -177,6 +251,12 @@ sed -i "s/\${external_address}/$EXTERNAL_IP/" docker-compose.yml
 sed -i "s/\${node_url}/${node_url}/" docker-compose.yml
 sed -i "s/\${moniker}/${moniker}/" docker-compose.yml
 sed -i "s/\${fetch_history}/${fetch_history}/" docker-compose.yml
+
+service postgresql start
+su - postgres -c "psql -c \"ALTER USER postgres WITH PASSWORD 'postgres';\""
+echo "host    all             all             172.17.0.0/16           md5" >> /etc/postgresql/14/main/pg_hba.conf
+echo "listen_addresses = '*'" >> /etc/postgresql/14/main/postgresql.conf
+service postgresql restart
 
 docker compose build
 docker compose up -d
